@@ -64,6 +64,16 @@ use std::mem::ManuallyDrop;
 use std::slice;
 use std::sync::Arc;
 
+/// Failed presents in a row (a lost surface or an unknown error) after which the graphics
+/// backend is rebuilt, also when its device reported no loss.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_FAILED_PRESENTS: u32 = 3;
+
+/// The wait before the next try when rebuilding the graphics backend failed: a new driver
+/// may still be installing.
+#[cfg(not(target_arch = "wasm32"))]
+const REBUILD_RETRY: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// Runs a [`Program`] with the provided settings.
 pub fn run<P>(program: P) -> Result<(), Error>
 where
@@ -514,6 +524,10 @@ async fn run_instance<P>(
     let mut is_window_opening = !is_daemon;
 
     let mut compositor = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut failed_presents: u32 = 0;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut rebuild_after: Option<Instant> = None;
     let mut events = Vec::new();
     let mut messages = Vec::new();
     let mut actions = 0;
@@ -768,6 +782,77 @@ async fn run_instance<P>(
                         event: event::WindowEvent::RedrawRequested,
                         ..
                     } => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(cause) = compositor.as_ref().and_then(|c| {
+                            if c.is_lost() {
+                                Some("its device was lost")
+                            } else if failed_presents >= MAX_FAILED_PRESENTS {
+                                Some("presenting failed repeatedly")
+                            } else {
+                                None
+                            }
+                        }) {
+                            if rebuild_after
+                                .is_some_and(|at| Instant::now() < at)
+                            {
+                                continue;
+                            }
+
+                            log::warn!(
+                                "Rebuilding the graphics backend: {cause}"
+                            );
+
+                            let Some(compatible) =
+                                window_manager.first().map(|w| w.raw.clone())
+                            else {
+                                continue;
+                            };
+
+                            match rebuild_compositor(
+                                &mut runtime,
+                                &mut window_manager,
+                                compatible,
+                                graphics_settings,
+                                &display_handle,
+                                &proxy,
+                                &default_fonts,
+                            ) {
+                                Ok(new) => {
+                                    log::warn!(
+                                        "Rebuilt the graphics backend on {}",
+                                        new.information().adapter
+                                    );
+
+                                    // The old compositor goes last, after every
+                                    // surface and renderer made on it.
+                                    compositor = Some(new);
+                                    failed_presents = 0;
+                                    rebuild_after = None;
+                                }
+                                Err(error) => {
+                                    log::error!(
+                                        "Rebuilding the graphics backend failed: \
+                                        {error}; trying again in {REBUILD_RETRY:?}"
+                                    );
+
+                                    rebuild_after =
+                                        Some(Instant::now() + REBUILD_RETRY);
+
+                                    let proxy = proxy.clone();
+                                    let _ = std::thread::Builder::new()
+                                        .name("iced_winit rebuild retry".into())
+                                        .spawn(move || {
+                                            std::thread::sleep(REBUILD_RETRY);
+                                            proxy.send_action(Action::Window(
+                                                runtime::window::Action::RedrawAll,
+                                            ));
+                                        });
+
+                                    continue;
+                                }
+                            }
+                        }
+
                         let Some(mut current_compositor) = compositor.as_mut()
                         else {
                             continue;
@@ -988,53 +1073,72 @@ async fn run_instance<P>(
                         ) {
                             Ok(()) => {
                                 present_span.finish();
+
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    failed_presents = 0;
+                                }
                             }
-                            Err(error) => match error {
-                                compositor::SurfaceError::OutOfMemory => {
-                                    // This is an unrecoverable error.
-                                    panic!("{error:?}");
+                            Err(error) => {
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if matches!(
+                                    error,
+                                    compositor::SurfaceError::Lost
+                                        | compositor::SurfaceError::Other
+                                ) {
+                                    failed_presents += 1;
                                 }
-                                compositor::SurfaceError::Outdated
-                                | compositor::SurfaceError::Lost => {
-                                    present_span.finish();
 
-                                    // Reconfigure surface and try redrawing
-                                    let physical_size =
-                                        window.state.physical_size();
-
-                                    if error == compositor::SurfaceError::Lost {
-                                        window.surface = current_compositor
-                                            .create_surface(
-                                                window.raw.clone(),
-                                                physical_size.width,
-                                                physical_size.height,
-                                            );
-                                    } else {
-                                        current_compositor.configure_surface(
-                                            &mut window.surface,
-                                            physical_size.width,
-                                            physical_size.height,
-                                        );
+                                match error {
+                                    compositor::SurfaceError::OutOfMemory => {
+                                        // This is an unrecoverable error.
+                                        panic!("{error:?}");
                                     }
+                                    compositor::SurfaceError::Outdated
+                                    | compositor::SurfaceError::Lost => {
+                                        present_span.finish();
 
-                                    window.raw.request_redraw();
-                                }
-                                _ => {
-                                    present_span.finish();
+                                        // Reconfigure surface and try redrawing
+                                        let physical_size =
+                                            window.state.physical_size();
 
-                                    log::error!(
-                                        "Error {error:?} when \
-                                        presenting surface."
-                                    );
+                                        if error
+                                            == compositor::SurfaceError::Lost
+                                        {
+                                            window.surface = current_compositor
+                                                .create_surface(
+                                                    window.raw.clone(),
+                                                    physical_size.width,
+                                                    physical_size.height,
+                                                );
+                                        } else {
+                                            current_compositor
+                                                .configure_surface(
+                                                    &mut window.surface,
+                                                    physical_size.width,
+                                                    physical_size.height,
+                                                );
+                                        }
 
-                                    // Try rendering all windows again next frame.
-                                    for (_id, window) in
-                                        window_manager.iter_mut()
-                                    {
                                         window.raw.request_redraw();
                                     }
+                                    _ => {
+                                        present_span.finish();
+
+                                        log::error!(
+                                            "Error {error:?} when \
+                                            presenting surface."
+                                        );
+
+                                        // Try rendering all windows again next frame.
+                                        for (_id, window) in
+                                            window_manager.iter_mut()
+                                        {
+                                            window.raw.request_redraw();
+                                        }
+                                    }
                                 }
-                            },
+                            }
                         }
                     }
                     event::Event::WindowEvent {
@@ -1274,6 +1378,52 @@ async fn run_instance<P>(
     }
 
     let _ = ManuallyDrop::into_inner(user_interfaces);
+}
+
+/// Replaces the graphics backend: a new compositor (instance, adapter, device) and, for every
+/// window, a new surface and renderer on it. The old surface goes before its window gets
+/// the new one configured: a window holds one swapchain at a time (DXGI, Vulkan).
+#[cfg(not(target_arch = "wasm32"))]
+fn rebuild_compositor<P, C>(
+    runtime: &mut Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
+    window_manager: &mut WindowManager<P, C>,
+    compatible: Arc<winit::window::Window>,
+    settings: graphics::Settings,
+    display: &winit::event_loop::OwnedDisplayHandle,
+    proxy: &Proxy<P::Message>,
+    fonts: &[Cow<'static, [u8]>],
+) -> Result<C, graphics::Error>
+where
+    P: Program,
+    C: Compositor<Renderer = P::Renderer>,
+    P::Theme: theme::Base,
+{
+    let mut new = runtime.block_on(C::new(
+        settings,
+        display.clone(),
+        compatible,
+        Shell::new(proxy.clone()),
+    ))?;
+
+    for font in fonts {
+        new.load_font(font.clone());
+    }
+
+    for (_id, window) in window_manager.iter_mut() {
+        let size = window.state.physical_size();
+        let fresh = new.create_surface(window.raw.clone(), 0, 0);
+
+        drop(std::mem::replace(&mut window.surface, fresh));
+
+        if size.width > 0 && size.height > 0 {
+            new.configure_surface(&mut window.surface, size.width, size.height);
+        }
+
+        window.renderer = new.create_renderer();
+        window.raw.request_redraw();
+    }
+
+    Ok(new)
 }
 
 /// Builds a window's [`UserInterface`] for the [`Program`].

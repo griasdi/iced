@@ -65,6 +65,12 @@ pub trait Compositor: Sized {
     /// Returns [`Information`] used by this [`Compositor`].
     fn information(&self) -> Information;
 
+    /// Whether the graphics device of the [`Compositor`] is gone (a driver update or reset, a
+    /// removed GPU): nothing it draws reaches a window again, and the shell replaces it.
+    fn is_lost(&self) -> bool {
+        false
+    }
+
     /// Loads a font from its bytes.
     fn load_font(&mut self, font: Cow<'static, [u8]>) {
         crate::text::font_system()

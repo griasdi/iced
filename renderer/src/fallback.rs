@@ -381,6 +381,10 @@ where
         delegate!(self, compositor, compositor.information())
     }
 
+    fn is_lost(&self) -> bool {
+        delegate!(self, compositor, compositor.is_lost())
+    }
+
     fn present(
         &mut self,
         renderer: &mut Self::Renderer,

@@ -7,6 +7,9 @@ use crate::graphics::{self, Shell, Viewport};
 use crate::settings::{self, Settings};
 use crate::{Engine, Renderer};
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// A window graphics backend for iced powered by `wgpu`.
 pub struct Compositor {
     instance: wgpu::Instance,
@@ -15,6 +18,7 @@ pub struct Compositor {
     alpha_mode: wgpu::CompositeAlphaMode,
     engine: Engine,
     settings: Settings,
+    lost: Arc<AtomicBool>,
 }
 
 /// A compositor error.
@@ -177,6 +181,15 @@ impl Compositor {
 
             match result {
                 Ok((device, queue)) => {
+                    let lost = Arc::new(AtomicBool::new(false));
+                    let flag = lost.clone();
+                    device.set_device_lost_callback(move |reason, message| {
+                        log::error!(
+                            "Graphics device lost ({reason:?}): {message}"
+                        );
+                        flag.store(true, Ordering::Relaxed);
+                    });
+
                     let engine = Engine::new(
                         &adapter,
                         device,
@@ -193,6 +206,7 @@ impl Compositor {
                         alpha_mode,
                         engine,
                         settings,
+                        lost,
                     });
                 }
                 Err(error) => {
@@ -345,6 +359,10 @@ impl graphics::Compositor for Compositor {
             adapter: information.name,
             backend: format!("{:?}", information.backend),
         }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
     }
 
     fn present(
