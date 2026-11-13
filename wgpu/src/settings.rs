@@ -13,6 +13,9 @@ pub struct Settings {
     pub present_mode: wgpu::PresentMode,
 
     /// The graphics backends to use.
+    ///
+    /// By default [`wgpu::Backends::PRIMARY`] on Windows and [`wgpu::Backends::all`] elsewhere;
+    /// the `WGPU_BACKEND` environment variable overrides it.
     pub backends: wgpu::Backends,
 
     /// The default [`Font`] to use.
@@ -33,7 +36,14 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             present_mode: wgpu::PresentMode::AutoVsync,
-            backends: wgpu::Backends::all(),
+            // On Windows GL is the GPU vendor's OpenGL driver (NVIDIA's nvoglv64.dll): when a driver
+            // update disconnects the GPU it ends the process before a lost device is rebuilt. Vulkan
+            // and DX12 (with WARP) cover every Windows; elsewhere GL stays for systems without Vulkan.
+            backends: if cfg!(windows) {
+                wgpu::Backends::PRIMARY
+            } else {
+                wgpu::Backends::all()
+            },
             default_font: Font::default(),
             default_text_size: Pixels(16.0),
             antialiasing: None,
